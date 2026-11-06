@@ -4,8 +4,9 @@
 Agents post milestones; a daemon serves them as Atom feeds and an HTML page,
 on 127.0.0.1 only. Nothing leaves the machine.
 
-    sneed post --agent "MLIPs" --kind result --title "sealed2 scored" \
-        --body "hgxz beats the event model by 5-10% in time" [--thread <id>]
+    sneed result "sealed2 scored" "hgxz beats the event model by 5-10% in time"
+    sneed launched|decision|blocked|note "<title>" ["<body>" | -]
+    sneed post --agent NAME --kind KIND --title TITLE [--body BODY] [--thread ID]
     sneed list [--agent NAME] [-n 20]
     sneed agents
     sneed serve [--port 8787]          # what the launchd agent runs
@@ -15,6 +16,10 @@ Feeds (subscribe in any reader):
     http://127.0.0.1:8787/feed.xml            every agent
     http://127.0.0.1:8787/agent/<slug>.xml    one agent
     http://127.0.0.1:8787/                    the page, grouped by agent
+
+The agent and thread default to $SNEED_AGENT, else Delta's $DELTA_THREAD_TITLE,
+and $DELTA_CURRENT_THREAD_ID, so inside a Delta thread a post needs only its
+kind and title. A body of `-` is read from stdin.
 
 Kinds: launched, result, decision, blocked, note (default). Entries live in
 ~/.local/share/sneed/feed.db (SQLite, or $SNEED_DB); posting writes there
@@ -186,12 +191,20 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     p = argparse.ArgumentParser(prog="sneed", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
+    env_agent = os.environ.get("SNEED_AGENT") or os.environ.get("DELTA_THREAD_TITLE")
+    env_thread = os.environ.get("DELTA_CURRENT_THREAD_ID")
     po = sub.add_parser("post", help="add an entry")
-    po.add_argument("--agent", required=True, help="who: the agent or thread's name, the same every time")
+    po.add_argument("--agent", default=env_agent, help="who: the agent or thread's name, the same every time")
     po.add_argument("--title", required=True, help="one line: what happened")
     po.add_argument("--body", default="", help="detail; '-' reads it from stdin")
     po.add_argument("--kind", default="note", choices=KINDS)
-    po.add_argument("--thread", help="the Delta thread ID, if any")
+    po.add_argument("--thread", default=env_thread, help="the Delta thread ID, if any")
+    for kind in KINDS:
+        k = sub.add_parser(kind, help=f"post a {kind} entry: TITLE [BODY]")
+        k.add_argument("title")
+        k.add_argument("body", nargs="?", default="", help="detail; '-' reads it from stdin")
+        k.add_argument("--agent", default=env_agent)
+        k.add_argument("--thread", default=env_thread)
     li = sub.add_parser("list", help="the latest entries")
     li.add_argument("--agent")
     li.add_argument("-n", type=int, default=20)
@@ -201,6 +214,10 @@ def main():
     se.add_argument("--port", type=int, default=PORT)
     sub.add_parser("url", help="where to subscribe")
     a = p.parse_args()
+    if a.cmd in KINDS:
+        a.kind, a.cmd = a.cmd, "post"
+    if a.cmd == "post" and not (a.agent or "").strip():
+        p.error("say who is posting: --agent NAME, or set SNEED_AGENT (Delta threads set DELTA_THREAD_TITLE)")
     c = connect()
     if a.cmd == "post":
         body = sys.stdin.read() if a.body == "-" else a.body
