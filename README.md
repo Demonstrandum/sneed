@@ -43,6 +43,10 @@ some-command | sneed note "Its output" -
   (the same every time: it names the agent's feed) or set `SNEED_AGENT`.
 - `sneed post --agent ... --kind ... --title ... [--body ...] [--thread ...]`
   is the long form.
+- Bodies are a little Markdown: paragraphs, `-` and `1.` lists, `|` tables,
+  fenced code, `` `code` ``, `**bold**`, `*italic*`, `[links](url)`. Feeds
+  carry them as HTML (NetNewsWire and other readers render it), with the
+  kind's coloured badge and a link that opens the thread in Delta.
 - `sneed list [--agent NAME] [-n 20]`, `sneed agents` and `sneed url` read it back.
 
 Posting writes straight to the database, so it works while the daemon is

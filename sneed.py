@@ -19,7 +19,9 @@ Feeds (subscribe in any reader):
 
 The agent and thread default to $SNEED_AGENT, else Delta's $DELTA_THREAD_TITLE,
 and $DELTA_CURRENT_THREAD_ID, so inside a Delta thread a post needs only its
-kind and title. A body of `-` is read from stdin.
+kind and title. A body of `-` is read from stdin. Bodies are a little Markdown
+(paragraphs, lists, tables, fenced code, `code`, **bold**, links), sent to
+readers as HTML, each entry with its kind's badge and a link to its thread.
 
 Kinds: launched, result, decision, blocked, note (default). Entries live in
 ~/.local/share/sneed/feed.db (SQLite, or $SNEED_DB); posting writes there
@@ -82,6 +84,99 @@ def agents(c):
     ).fetchall()
 
 
+def inline(text):
+    """One line of Markdown's inline forms, escaped: `code`, **bold**,
+    *italic*, [text](url) and bare http(s) links."""
+    out, parts = [], re.split(r"(`[^`]+`)", text)
+    for part in parts:
+        if part.startswith("`") and part.endswith("`") and len(part) > 1:
+            out.append(f"<code>{html.escape(part[1:-1])}</code>")
+            continue
+        s = html.escape(part, quote=False)
+        s = re.sub(r"\[([^\]]+)\]\(((?:https?|delta)://[^\s)]+)\)", lambda m: f'<a href="{html.escape(m.group(2))}">{m.group(1)}</a>', s)
+        s = re.sub(r'(?<!["=>])\b(https?://[^\s<]+[^\s<.,;:!?)])', r'<a href="\1">\1</a>', s)
+        s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+        s = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<em>\1</em>", s)
+        out.append(s)
+    return "".join(out)
+
+
+def rich(text):
+    """A body in a little Markdown as HTML: paragraphs, `-`/`*` and `1.`
+    lists, ```fenced code```, `#` headings, `|` tables, `>` quotes, and the
+    inline forms of `inline`. Anything else is a paragraph, line breaks
+    kept."""
+    lines = text.splitlines()
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("```"):
+            j = i + 1
+            while j < len(lines) and not lines[j].startswith("```"):
+                j += 1
+            out.append("<pre><code>" + html.escape("\n".join(lines[i + 1 : j])) + "</code></pre>")
+            i = j + 1
+        elif not line.strip():
+            i += 1
+        elif m := re.match(r"(#{1,4})\s+(.*)", line):
+            n = min(len(m.group(1)) + 2, 6)
+            out.append(f"<h{n}>{inline(m.group(2))}</h{n}>")
+            i += 1
+        elif re.match(r"\s*\|", line):
+            rows_ = []
+            while i < len(lines) and re.match(r"\s*\|", lines[i]):
+                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                if not all(re.fullmatch(r":?-+:?", c) for c in cells):
+                    rows_.append(cells)
+                i += 1
+            head, *body = rows_ or [[]]
+            t = "<table><tr>" + "".join(f"<th>{inline(c)}</th>" for c in head) + "</tr>"
+            t += "".join("<tr>" + "".join(f"<td>{inline(c)}</td>" for c in r) + "</tr>" for r in body)
+            out.append(t + "</table>")
+        elif re.match(r"\s*([-*]|\d+\.)\s+", line):
+            ordered = bool(re.match(r"\s*\d+\.", line))
+            items = []
+            while i < len(lines) and (m := re.match(r"\s*(?:[-*]|\d+\.)\s+(.*)", lines[i])):
+                items.append(m.group(1))
+                i += 1
+                # Indented lines continue the item.
+                while i < len(lines) and lines[i].startswith("  ") and not re.match(r"\s*([-*]|\d+\.)\s+", lines[i]):
+                    items[-1] += " " + lines[i].strip()
+                    i += 1
+            tag = "ol" if ordered else "ul"
+            out.append(f"<{tag}>" + "".join(f"<li>{inline(x)}</li>" for x in items) + f"</{tag}>")
+        elif line.startswith(">"):
+            q = []
+            while i < len(lines) and lines[i].startswith(">"):
+                q.append(lines[i][1:].strip())
+                i += 1
+            out.append("<blockquote>" + "<br>".join(inline(x) for x in q) + "</blockquote>")
+        else:
+            p = []
+            while i < len(lines) and lines[i].strip() and not re.match(r"```|#{1,4}\s|\s*\||\s*([-*]|\d+\.)\s+|>", lines[i]):
+                p.append(inline(lines[i]))
+                i += 1
+            out.append("<p>" + "<br>".join(p) + "</p>")
+    return "\n".join(out)
+
+
+# Each kind's colour, for its badge.
+COLOURS = {"launched": "#b26b00", "result": "#2e7d32", "decision": "#1565c0", "blocked": "#c62828", "note": "#616161"}
+
+
+def entry_html(agent, thread, kind, body, time):
+    """An entry's content as a reader shows it: its kind and agent, the
+    body as rich text, and a link back to its Delta thread."""
+    e = html.escape
+    colour = COLOURS.get(kind, "#616161")
+    head = (
+        f'<p><span style="background:{colour};color:#fff;border-radius:4px;padding:1px 6px;font-size:85%">'
+        f"{e(kind)}</span> <strong>{e(agent)}</strong> <small>{e(time)}</small></p>"
+    )
+    foot = f'<p><small><a href="delta://thread/{e(thread)}">Open the thread in Delta</a></small></p>' if thread else ""
+    return head + rich(body) + foot
+
+
 def atom(entries, title, self_url, base):
     e = html.escape
     updated = entries[0][1] if entries else now()
@@ -96,7 +191,6 @@ def atom(entries, title, self_url, base):
         "<author><name>sneed</name></author>",
     ]
     for i, time, agent, thread, kind, ttl, body in entries:
-        text = body + (f"\n\nthread: {thread}" if thread else "")
         out += [
             "<entry>",
             f"<title>[{e(agent)}] {e(kind)}: {e(ttl)}</title>",
@@ -106,7 +200,8 @@ def atom(entries, title, self_url, base):
             f"<author><name>{e(agent)}</name></author>",
             f'<category term="{e(agent)}" label="agent"/>',
             f'<category term="{e(kind)}" label="kind"/>',
-            f'<content type="text">{e(text)}</content>',
+            f'<summary type="text">{e(body.splitlines()[0] if body else ttl)}</summary>',
+            f'<content type="html">{e(entry_html(agent, thread, kind, body, time))}</content>',
             "</entry>",
         ]
     out.append("</feed>")
@@ -117,7 +212,8 @@ STYLE = """body{font:15px/1.45 -apple-system,system-ui,sans-serif;max-width:52re
 h1{font-size:1.4rem}h2{font-size:1.1rem;margin-top:2rem;border-bottom:1px solid #ddd}
 .e{margin:.8rem 0}.m{color:#777;font-size:.85rem}.k{display:inline-block;padding:0 .4rem;border-radius:.3rem;background:#eee;font-size:.8rem}
 .blocked{background:#fdd}.result{background:#dfd}.decision{background:#def}.launched{background:#ffe9c7}
-pre{white-space:pre-wrap;margin:.3rem 0 0;font:inherit}a{color:#2a5db0}"""
+pre{white-space:pre-wrap;margin:.3rem 0 0}a{color:#2a5db0}code{font-size:90%;background:#f3f3f3;padding:0 .2rem;border-radius:.2rem}
+table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:.15rem .5rem}.b{margin:.2rem 0 0 .2rem}"""
 
 
 def page(c, only=None):
@@ -134,7 +230,8 @@ def page(c, only=None):
             parts.append(
                 f'<div class=e id="e{i}"><span class="k {e(kind)}">{e(kind)}</span> <b>{e(ttl)}</b> '
                 f'<span class=m>{e(time)}{" · " + e(thread) if thread else ""}</span>'
-                + (f"<pre>{e(body)}</pre>" if body else "")
+                + (f'<div class=b>{rich(body)}</div>' if body else "")
+                + (f' <a class=m href="delta://thread/{e(thread)}">open in Delta</a>' if thread else "")
                 + "</div>"
             )
     return "".join(parts)
